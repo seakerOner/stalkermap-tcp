@@ -6,3 +6,4 @@ description = "TCP utilities with custom handshakes for multiple port‑scanning
 readme = "README.md"
 
 [dependencies]
+libc = "0.2.177"
