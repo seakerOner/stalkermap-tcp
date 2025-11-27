@@ -13,9 +13,10 @@
 //
 // In short: AF_PACKET for raw TX, TPACKET_V3 for zero‑copy RX, TCP state is all ours. :D
 
-use libc::{AF_PACKET, ETH_P_ALL, SOCK_RAW, htons, sockaddr_ll, socket};
+use libc::{AF_PACKET, ETH_P_ALL, SOCK_RAW, htons, if_nametoindex, sockaddr_ll, socket};
+use std::fs;
+use std::io::{self, BufRead};
 use std::mem;
-
 use std::os::fd::RawFd;
 
 // open packet socket to send raw packets at the device driver (OSI Layer 2) level.
@@ -24,11 +25,51 @@ fn open_af_packet() -> RawFd {
         let fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL as u16) as i32);
 
         if fd < 0 {
-            panic!("AF_PACKET sys call failed");
+            let err = *libc::__errno_location();
+            if err == 1 || err == 13 {
+                panic!("AF_PACKET sys call failed; Error: {}; No permissions", err);
+            } else {
+                panic!("AF_PACKET sys call failed; Error: {}", err);
+            }
         }
 
         fd
     }
+}
+
+fn get_default_ifindex() -> io::Result<i32> {
+    let file = fs::File::open("/proc/net/route")?;
+    let reader = io::BufReader::new(file);
+
+    for line in reader.lines().skip(1) {
+        let line = line?;
+        let cols: Vec<&str> = line.split_whitespace().collect();
+
+        if cols.len() < 2 {
+            continue;
+        }
+
+        let iface = cols[0];
+        let destination = cols[1];
+
+        if destination == "00000000" {
+            let c_name = std::ffi::CString::new(iface).unwrap();
+            let index = unsafe { if_nametoindex(c_name.as_ptr()) };
+
+            if index == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("if_nametoindex failed for {}", iface),
+                ));
+            }
+            return Ok(index as i32);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "No default route found",
+    ))
 }
 
 fn bind_interface(fd: RawFd, if_index: i32) {
@@ -56,10 +97,13 @@ mod tests {
 
     #[test]
     fn linux_af_packet_test() {
-        let if_index = 2;
+        let if_index = get_default_ifindex();
+
+        assert!(if_index.is_ok());
 
         let fd = open_af_packet();
-        bind_interface(fd, if_index);
+
+        bind_interface(fd, if_index.unwrap());
 
         let mut buf = [0u8; u16::MAX as usize];
         unsafe {
