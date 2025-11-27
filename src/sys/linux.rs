@@ -13,11 +13,16 @@
 //
 // In short: AF_PACKET for raw TX, TPACKET_V3 for zero‑copy RX, TCP state is all ours. :D
 
-use libc::{AF_PACKET, ETH_P_ALL, SOCK_RAW, htons, if_nametoindex, sockaddr_ll, socket};
+use libc::{
+    AF_PACKET, ETH_P_ALL, SOCK_RAW, htons, if_nametoindex, setsockopt, sockaddr_ll, socket,
+};
+use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead};
 use std::mem;
 use std::os::fd::RawFd;
+
+const TPACKET_V3: libc::c_int = 2;
 
 // open packet socket to send raw packets at the device driver (OSI Layer 2) level.
 fn open_af_packet() -> RawFd {
@@ -26,10 +31,14 @@ fn open_af_packet() -> RawFd {
 
         if fd < 0 {
             let err = *libc::__errno_location();
-            if err == 1 || err == 13 {
-                panic!("AF_PACKET sys call failed; Error: {}; No permissions", err);
+            if err == libc::EPERM || err == libc::EACCES {
+                panic!(
+                    "AF_PACKET sys call failed;\n Error number: {}; No permissions \n \n Error: CAP_NET_RAW or root privileges required to use raw AF_PACKET sockets.\n - Run with: sudo <cmd>\n - Or give the binary capability: sudo setcap cap_net_raw+ep <binary>\n
+                    ",
+                    err
+                );
             } else {
-                panic!("AF_PACKET sys call failed; Error: {}", err);
+                panic!("AF_PACKET sys call failed; Error number: {}", err);
             }
         }
 
@@ -66,9 +75,15 @@ fn get_default_ifindex() -> io::Result<i32> {
         }
     }
 
+    let fallback = unsafe { if_nametoindex(std::ffi::CString::new("lo").unwrap().as_ptr()) };
+
+    if fallback != 0 {
+        return Ok(fallback as i32);
+    }
+
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "No default route found",
+        "No usable route found",
     ))
 }
 
@@ -91,6 +106,61 @@ fn bind_interface(fd: RawFd, if_index: i32) {
     }
 }
 
+fn set_sock_opt(fd: RawFd) -> *mut c_void {
+    let version = TPACKET_V3;
+
+    let r = unsafe {
+        setsockopt(
+            fd,
+            libc::SOL_PACKET,
+            libc::PACKET_VERSION,
+            &version as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+
+    assert!(r == 0, "Failed to set PACKET_VERSION TPACKET_V3");
+
+    let req = libc::tpacket_req3 {
+        tp_block_size: 1 << 20, // 1MB blocks
+        tp_block_nr: 64,
+        tp_frame_size: 2048,
+        tp_frame_nr: (64 * (1 << 20)) / 2048,
+        tp_retire_blk_tov: 60, // timeout
+        tp_sizeof_priv: 0,
+        tp_feature_req_word: 0,
+    };
+
+    let ret = unsafe {
+        setsockopt(
+            fd,
+            libc::SOL_PACKET,
+            libc::PACKET_RX_RING,
+            &req as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::tpacket_req3>() as libc::socklen_t,
+        )
+    };
+
+    assert!(ret == 0, "Failed to set PACKET_RX_RING");
+
+    let mmap_len = (req.tp_block_size * req.tp_block_nr) as usize;
+
+    unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mmap_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    }
+}
+
+fn close_socket(fd: RawFd) {
+    unsafe { libc::close(fd) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +180,21 @@ mod tests {
             let n = libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0);
             assert!(n > 0);
         }
+    }
+
+    #[test]
+    fn linux_af_packet_test_with_ring_buffer() {
+        let if_index = get_default_ifindex();
+
+        assert!(if_index.is_ok());
+
+        let fd = open_af_packet();
+
+        bind_interface(fd, if_index.unwrap());
+
+        let mmap_ptr = set_sock_opt(fd);
+
+        assert!(!mmap_ptr.is_null(), "mmap returned null pointer");
+        close_socket(fd);
     }
 }
