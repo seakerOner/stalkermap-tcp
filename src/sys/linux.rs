@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead};
 use std::mem;
+use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 
 const TPACKET_V3: libc::c_int = 2;
@@ -46,7 +47,61 @@ fn open_af_packet() -> RawFd {
     }
 }
 
-fn get_default_ifindex() -> io::Result<i32> {
+fn lookup_arp_cache(ip: Ipv4Addr) -> io::Result<Option<[u8; 6]>> {
+    let file = fs::File::open("proc/net/arp")?;
+    let reader = io::BufReader::new(file);
+
+    for line in reader.lines().skip(1) {
+        let line = line?;
+        let cols: Vec<&str> = line.split_whitespace().collect();
+
+        if cols.len() < 6 {
+            continue;
+        }
+
+        let ip_addr = cols[0];
+        if ip_addr != ip.to_string() {
+            continue;
+        }
+
+        let hw_addr = cols[3];
+        if hw_addr == "00:00:00:00:00:00" {
+            return Ok(None);
+        }
+
+        let bytes: Vec<u8> = hw_addr
+            .split(':')
+            .filter_map(|s| u8::from_str_radix(s, 16).ok())
+            .collect();
+
+        if bytes.len() != 6 {
+            continue;
+        }
+
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&bytes);
+        return Ok(Some(mac));
+    }
+    Ok(None)
+}
+
+pub fn resolve_mac(socket: &LinuxSocket, dst_ip: Ipv4Addr) -> io::Result<[u8; 6]> {
+    if let Some(mac) = lookup_arp_cache(dst_ip)? {
+        return Ok(mac);
+    }
+
+    if let Some(mac) = lookup_arp_cache(socket.default_gateway)? {
+        return Ok(mac);
+    }
+
+    // Gateway MAC missing... Needs ARP request (not implemented yet)
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "MAC address not found in ARP for dst or gateway",
+    ))
+}
+
+fn get_default_ifindex_and_default_gateway() -> io::Result<(i32, Ipv4Addr)> {
     let file = fs::File::open("/proc/net/route")?;
     let reader = io::BufReader::new(file);
 
@@ -60,6 +115,7 @@ fn get_default_ifindex() -> io::Result<i32> {
 
         let iface = cols[0];
         let destination = cols[1];
+        let gateway_hex = cols[2];
 
         if destination == "00000000" {
             let c_name = std::ffi::CString::new(iface).unwrap();
@@ -71,14 +127,17 @@ fn get_default_ifindex() -> io::Result<i32> {
                     format!("if_nametoindex failed for {}", iface),
                 ));
             }
-            return Ok(index as i32);
+
+            let g = u32::from_str_radix(gateway_hex, 16).unwrap();
+
+            return Ok((index as i32, Ipv4Addr::from(g.swap_bytes())));
         }
     }
 
     let fallback = unsafe { if_nametoindex(std::ffi::CString::new("lo").unwrap().as_ptr()) };
 
     if fallback != 0 {
-        return Ok(fallback as i32);
+        return Ok((fallback as i32, Ipv4Addr::new(127, 0, 0, 1)));
     }
 
     Err(io::Error::new(
@@ -180,24 +239,28 @@ pub enum SetSockOpsErrors {
     Mmap(String),
 }
 
-fn close_socket(fd: RawFd) {
-    unsafe { libc::close(fd) };
-}
-
 #[derive(Debug)]
 pub struct LinuxSocket {
-    fd: RawFd,
-    mmap: Option<(*mut c_void, usize)>,
+    pub fd: RawFd,
+    pub ifindex: i32,
+    pub default_gateway: Ipv4Addr,
+    pub mmap: Option<(*mut c_void, usize)>,
 }
 
 impl LinuxSocket {
     pub fn new() -> Result<Self, LinuxSocketErrors> {
-        let if_index = get_default_ifindex().map_err(|e| LinuxSocketErrors::DefaultIfIndex(e))?;
+        let (ifindex, default_gateway) = get_default_ifindex_and_default_gateway()
+            .map_err(|e| LinuxSocketErrors::DefaultIfIndex(e))?;
 
         let fd = open_af_packet();
-        bind_interface(fd, if_index);
+        bind_interface(fd, ifindex);
 
-        Ok(LinuxSocket { fd, mmap: None })
+        Ok(LinuxSocket {
+            fd,
+            default_gateway,
+            ifindex,
+            mmap: None,
+        })
     }
 
     pub fn set_ops(&mut self) -> Result<(), LinuxSocketErrors> {
@@ -206,6 +269,36 @@ impl LinuxSocket {
 
         self.mmap.replace((mmap, ptr_len));
         Ok(())
+    }
+
+    pub fn send_raw_packet(
+        &self,
+        dst_mac: [u8; 6],
+        ether_type: u16,
+        packet: &[u8],
+    ) -> Result<(), LinuxSocketErrors> {
+        unsafe {
+            let mut addr: sockaddr_ll = mem::zeroed();
+            addr.sll_family = AF_PACKET as u16;
+            addr.sll_ifindex = self.ifindex;
+            addr.sll_protocol = htons(ether_type);
+            addr.sll_halen = 6;
+            addr.sll_addr[..6].copy_from_slice(&dst_mac);
+
+            let sent = libc::sendto(
+                self.fd,
+                packet.as_ptr() as *const _ as *const c_void,
+                packet.len(),
+                0,
+                &addr as *const sockaddr_ll as *const libc::sockaddr,
+                mem::size_of::<sockaddr_ll>() as u32,
+            );
+
+            if sent == -1 {
+                return Err(LinuxSocketErrors::SendingPacket(io::Error::last_os_error()));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -217,7 +310,8 @@ impl Drop for LinuxSocket {
                 eprintln!("Failed to remove any mappings from the adress space");
             }
         }
-        close_socket(self.fd);
+
+        unsafe { libc::close(self.fd) };
     }
 }
 
@@ -225,21 +319,22 @@ impl Drop for LinuxSocket {
 pub enum LinuxSocketErrors {
     DefaultIfIndex(std::io::Error),
     SetSockOps(SetSockOpsErrors),
+    SendingPacket(std::io::Error),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
     fn linux_af_packet_test() {
-        let if_index = get_default_ifindex();
-
-        assert!(if_index.is_ok());
+        let (if_index, _default_gateway) = get_default_ifindex_and_default_gateway().unwrap();
 
         let fd = open_af_packet();
 
-        bind_interface(fd, if_index.unwrap());
+        bind_interface(fd, if_index);
 
         let mut buf = [0u8; u16::MAX as usize];
         unsafe {
@@ -250,13 +345,11 @@ mod tests {
 
     #[test]
     fn linux_af_packet_test_with_ring_buffer() {
-        let if_index = get_default_ifindex();
-
-        assert!(if_index.is_ok());
+        let (if_index, _default_gateway) = get_default_ifindex_and_default_gateway().unwrap();
 
         let fd = open_af_packet();
 
-        bind_interface(fd, if_index.unwrap());
+        bind_interface(fd, if_index);
 
         let mmap_ptr = set_sock_opt(fd);
 
