@@ -3,6 +3,8 @@ name = "stalkermap-tcp"
 version = "0.1.0"
 edition = "2024"
 description = "TCP utilities with custom handshakes for multiple port‑scanning techniques"
+repository = "https://github.com/seakerOner/stalkermap-tcp"
+keywords = ["network", "tcp"]
 readme = "README.md"
 
 [dependencies]
