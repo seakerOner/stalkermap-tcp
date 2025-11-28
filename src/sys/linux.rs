@@ -5,7 +5,7 @@
 //    - It is protocol‑agnostic: you serialize your own TCP/IP headers.
 //
 // 2. TPACKET_V3 is enabled on this AF_PACKET socket to receive packets efficiently.
-//    - The kernel writes packets into this shared ring area (zero‑copy).
+//    - The kernel writes packets into this shared ring area (zero copy).
 //    - User space polls/reads frames directly from the mmap'd ring.
 //
 // 3. All TCP logic (flags, seq/ack, retransmission, state machine, matching responses)
@@ -106,7 +106,7 @@ fn bind_interface(fd: RawFd, if_index: i32) {
     }
 }
 
-fn set_sock_opt(fd: RawFd) -> *mut c_void {
+fn set_sock_opt(fd: RawFd) -> Result<(*mut c_void, usize), SetSockOpsErrors> {
     let version = TPACKET_V3;
 
     let r = unsafe {
@@ -119,7 +119,11 @@ fn set_sock_opt(fd: RawFd) -> *mut c_void {
         )
     };
 
-    assert!(r == 0, "Failed to set PACKET_VERSION TPACKET_V3");
+    if r != 0 {
+        return Err(SetSockOpsErrors::PacketVersion(
+            "Failed to set PACKET_VERSION TPACKET_V3".to_string(),
+        ));
+    }
 
     let req = libc::tpacket_req3 {
         tp_block_size: 1 << 20, // 1MB blocks
@@ -141,11 +145,15 @@ fn set_sock_opt(fd: RawFd) -> *mut c_void {
         )
     };
 
-    assert!(ret == 0, "Failed to set PACKET_RX_RING");
+    if ret != 0 {
+        return Err(SetSockOpsErrors::RingBuffer(
+            "Failed to set PACKET_RX_RING".to_string(),
+        ));
+    }
 
     let mmap_len = (req.tp_block_size * req.tp_block_nr) as usize;
 
-    unsafe {
+    let mmap = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             mmap_len,
@@ -154,11 +162,69 @@ fn set_sock_opt(fd: RawFd) -> *mut c_void {
             fd,
             0,
         )
+    };
+
+    if mmap.is_null() {
+        return Err(SetSockOpsErrors::Mmap(
+            "Failed set mmap on ring buffer".to_string(),
+        ));
     }
+
+    Ok((mmap, mmap_len))
+}
+
+#[derive(Debug)]
+pub enum SetSockOpsErrors {
+    PacketVersion(String),
+    RingBuffer(String),
+    Mmap(String),
 }
 
 fn close_socket(fd: RawFd) {
     unsafe { libc::close(fd) };
+}
+
+#[derive(Debug)]
+pub struct LinuxSocket {
+    fd: RawFd,
+    mmap: Option<(*mut c_void, usize)>,
+}
+
+impl LinuxSocket {
+    pub fn new() -> Result<Self, LinuxSocketErrors> {
+        let if_index = get_default_ifindex().map_err(|e| LinuxSocketErrors::DefaultIfIndex(e))?;
+
+        let fd = open_af_packet();
+        bind_interface(fd, if_index);
+
+        Ok(LinuxSocket { fd, mmap: None })
+    }
+
+    pub fn set_ops(&mut self) -> Result<(), LinuxSocketErrors> {
+        let (mmap, ptr_len) =
+            set_sock_opt(self.fd).map_err(|e| LinuxSocketErrors::SetSockOps(e))?;
+
+        self.mmap.replace((mmap, ptr_len));
+        Ok(())
+    }
+}
+
+impl Drop for LinuxSocket {
+    fn drop(&mut self) {
+        if let Some((mmap, ptr_len)) = self.mmap.take() {
+            let res = unsafe { libc::munmap(mmap, ptr_len) };
+            if res != 0 {
+                eprintln!("Failed to remove any mappings from the adress space");
+            }
+        }
+        close_socket(self.fd);
+    }
+}
+
+#[derive(Debug)]
+pub enum LinuxSocketErrors {
+    DefaultIfIndex(std::io::Error),
+    SetSockOps(SetSockOpsErrors),
 }
 
 #[cfg(test)]
@@ -194,7 +260,25 @@ mod tests {
 
         let mmap_ptr = set_sock_opt(fd);
 
-        assert!(!mmap_ptr.is_null(), "mmap returned null pointer");
-        close_socket(fd);
+        assert!(mmap_ptr.is_ok());
+
+        let (mmap, len) = mmap_ptr.unwrap();
+
+        let res = unsafe { libc::munmap(mmap, len) };
+
+        assert!(res == 0);
+    }
+
+    #[test]
+    fn linux_socket_test() {
+        let socket = LinuxSocket::new();
+
+        assert!(socket.is_ok());
+
+        let mut s = socket.unwrap();
+
+        let res = s.set_ops();
+
+        assert!(res.is_ok());
     }
 }
