@@ -11,7 +11,7 @@ pub enum TcpSynErrors {
 }
 
 impl TcpSyn {
-    fn init() -> Result<Self, TcpSynErrors> {
+    pub fn init() -> Result<Self, TcpSynErrors> {
         #[cfg(target_os = "linux")]
         {
             use crate::LinuxSocket;
@@ -28,7 +28,8 @@ impl TcpSyn {
         }
     }
 
-    fn connect(&mut self, ip: std::net::Ipv4Addr, port: u16) -> Result<(), TcpSynErrors> {
+    /// Don't use this, still work in progress :D
+    pub fn connect(&mut self, ip: std::net::Ipv4Addr, _port: u16) -> Result<(), TcpSynErrors> {
         #[cfg(target_os = "linux")]
         {
             use crate::sys::resolve_mac;
