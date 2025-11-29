@@ -1,6 +1,6 @@
 [package]
 name = "stalkermap-tcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "TCP utilities with custom handshakes for multiple port‑scanning techniques"
