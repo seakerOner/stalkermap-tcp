@@ -53,7 +53,6 @@ impl PacketFrame {
 
             tcp_header.serialize(&mut buf);
         }
-        self.tcp_header.serialize(&mut buf);
 
         buf.extend_from_slice(payload);
 
