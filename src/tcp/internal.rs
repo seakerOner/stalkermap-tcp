@@ -5,7 +5,7 @@ pub struct PacketFrame {
 }
 
 impl PacketFrame {
-    pub fn new(
+    pub fn new_raw(
         ethernet_header: EthernetHeader,
         ipv4_header: Ipv4Header,
         tcp_header: TcpHeader,
@@ -17,16 +17,49 @@ impl PacketFrame {
         }
     }
 
-    pub fn serialize(&mut self, payload: &[u8]) -> Vec<u8> {
+    pub fn new_tcp(
+        tcp_flags: &[TcpFlags],
+        dst_ip: std::net::Ipv4Addr,
+        dst_port: u16,
+        dst_mac: [u8; 6],
+        src_ip: [u8; 4],
+        src_mac: [u8; 6],
+    ) -> Self {
+        let ethernet_header = EthernetHeader::new(dst_mac, src_mac, libc::ETH_P_IP as u16);
+
+        let payload_len = 0;
+        let ipv4_header = Ipv4Header::new(src_ip, dst_ip.octets(), payload_len);
+
+        let window_size = 64240;
+
+        let seq: u32 = rand::random::<u32>();
+        let mut ack = 0;
+
+        // if syn-ack --> ack = syn_seq + 1
+        if tcp_flags.len() == 1 && tcp_flags[0] == TcpFlags::SYN {
+            ack = 0;
+        }
+
+        let src_port: u16 = rand::random_range(1024..65535);
+        let tcp_header = TcpHeader::new(src_port, dst_port, seq, ack, tcp_flags, window_size);
+        PacketFrame {
+            ethernet_header,
+            ipv4_header,
+            tcp_header,
+        }
+    }
+
+    pub fn serialize_raw(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1500);
 
         self.ethernet_header.serialize(&mut buf);
 
         {
             let ip_header = &mut self.ipv4_header;
-            ip_header.total_length = (20 + 20 + payload.len() as u16).to_be();
+            ip_header.total_length = 20 + 20 + payload.len() as u16;
 
             let mut tmp = Vec::new();
+            ip_header.header_checksum = 0;
             ip_header.serialize(&mut tmp);
             ip_header.header_checksum = checksum(&tmp);
 
@@ -71,7 +104,7 @@ impl EthernetHeader {
         EthernetHeader {
             dst_mac,
             src_mac,
-            ethertype: ethertype.to_be(),
+            ethertype: ethertype,
         }
     }
 
@@ -107,8 +140,8 @@ impl Ipv4Header {
         Ipv4Header {
             version_ihl,
             type_of_service: 0,
-            total_length: total_length.to_be(),
-            identification: 0,     // change this
+            total_length: total_length,
+            identification: rand::random(),
             flags_and_fragment: 0, // DF=0 MF=0 offset=0
             ttl: 64,
             protocol: 6,        // TCP
@@ -149,20 +182,25 @@ impl TcpHeader {
         dst_port: u16,
         seq: u32,
         ack: u32,
-        flags: TcpFlags,
+        flags: &[TcpFlags],
         window_size: u16,
     ) -> Self {
         let data_offset: u16 = 5;
 
-        let data_offset_reserved_flags = (data_offset << 12) | (flags as u16 & 0x0FFF);
+        let mut flags_formatted: u16 = 0x00;
+        for flag in flags {
+            flags_formatted |= flag.clone() as u16;
+        }
+
+        let data_offset_reserved_flags = (data_offset << 12) | (flags_formatted & 0x0FFF);
 
         TcpHeader {
-            source_port: src_port.to_be(),
-            destination_port: dst_port.to_be(),
-            seq_number: seq.to_be(),
-            ack_number: ack.to_be(),
-            data_offset_reserved_flags: data_offset_reserved_flags.to_be(),
-            window_size: window_size.to_be(),
+            source_port: src_port,
+            destination_port: dst_port,
+            seq_number: seq,
+            ack_number: ack,
+            data_offset_reserved_flags: data_offset_reserved_flags,
+            window_size: window_size,
             checksum: 0,
             urgent_ptr: 0,
         }
@@ -180,6 +218,7 @@ impl TcpHeader {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum TcpFlags {
     FIN = 0x01,
     SYN = 0x02,

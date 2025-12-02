@@ -10,3 +10,4 @@ keywords = ["network", "tcp"]
 
 [dependencies]
 libc = "0.2.177"
+rand = "0.9.2"

@@ -48,7 +48,7 @@ fn open_af_packet() -> RawFd {
 }
 
 fn lookup_arp_cache(ip: Ipv4Addr) -> io::Result<Option<[u8; 6]>> {
-    let file = fs::File::open("proc/net/arp")?;
+    let file = fs::File::open("/proc/net/arp")?;
     let reader = io::BufReader::new(file);
 
     for line in reader.lines().skip(1) {
@@ -101,7 +101,21 @@ pub fn resolve_mac(socket: &LinuxSocket, dst_ip: Ipv4Addr) -> io::Result<[u8; 6]
     ))
 }
 
-fn get_default_ifindex_and_default_gateway() -> io::Result<(i32, Ipv4Addr)> {
+pub fn resolve_src_mac(iface: &str) -> io::Result<[u8; 6]> {
+    let path = format!("/sys/class/net/{}/address", iface);
+    let s = fs::read_to_string(path)?.trim().to_string();
+
+    let bytes: Vec<u8> = s
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16).unwrap())
+        .collect();
+
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&bytes);
+    Ok(mac)
+}
+
+fn get_default_ifindex_and_default_gateway() -> io::Result<(String, i32, Ipv4Addr)> {
     let file = fs::File::open("/proc/net/route")?;
     let reader = io::BufReader::new(file);
 
@@ -130,14 +144,22 @@ fn get_default_ifindex_and_default_gateway() -> io::Result<(i32, Ipv4Addr)> {
 
             let g = u32::from_str_radix(gateway_hex, 16).unwrap();
 
-            return Ok((index as i32, Ipv4Addr::from(g.swap_bytes())));
+            return Ok((
+                iface.to_string(),
+                index as i32,
+                Ipv4Addr::from(g.swap_bytes()),
+            ));
         }
     }
 
     let fallback = unsafe { if_nametoindex(std::ffi::CString::new("lo").unwrap().as_ptr()) };
 
     if fallback != 0 {
-        return Ok((fallback as i32, Ipv4Addr::new(127, 0, 0, 1)));
+        return Ok((
+            "lo".to_string(),
+            fallback as i32,
+            Ipv4Addr::new(127, 0, 0, 1),
+        ));
     }
 
     Err(io::Error::new(
@@ -244,13 +266,15 @@ pub struct LinuxSocket {
     pub fd: RawFd,
     pub ifindex: i32,
     pub default_gateway: Ipv4Addr,
+    pub src_mac: [u8; 6],
     pub mmap: Option<(*mut c_void, usize)>,
 }
 
 impl LinuxSocket {
     pub fn new() -> Result<Self, LinuxSocketErrors> {
-        let (ifindex, default_gateway) = get_default_ifindex_and_default_gateway()
-            .map_err(|e| LinuxSocketErrors::DefaultIfIndex(e))?;
+        let (iface, ifindex, default_gateway) =
+            get_default_ifindex_and_default_gateway().map_err(|e| LinuxSocketErrors::Io(e))?;
+        let src_mac = resolve_src_mac(iface.as_str()).map_err(|e| LinuxSocketErrors::Io(e))?;
 
         let fd = open_af_packet();
         bind_interface(fd, ifindex);
@@ -259,6 +283,7 @@ impl LinuxSocket {
             fd,
             default_gateway,
             ifindex,
+            src_mac,
             mmap: None,
         })
     }
@@ -317,7 +342,7 @@ impl Drop for LinuxSocket {
 
 #[derive(Debug)]
 pub enum LinuxSocketErrors {
-    DefaultIfIndex(std::io::Error),
+    Io(std::io::Error),
     SetSockOps(SetSockOpsErrors),
     SendingPacket(std::io::Error),
 }
@@ -329,7 +354,8 @@ mod tests {
 
     #[test]
     fn linux_af_packet_test() {
-        let (if_index, _default_gateway) = get_default_ifindex_and_default_gateway().unwrap();
+        let (_iface, if_index, _default_gateway) =
+            get_default_ifindex_and_default_gateway().unwrap();
 
         let fd = open_af_packet();
 
@@ -344,7 +370,8 @@ mod tests {
 
     #[test]
     fn linux_af_packet_test_with_ring_buffer() {
-        let (if_index, _default_gateway) = get_default_ifindex_and_default_gateway().unwrap();
+        let (_iface, if_index, _default_gateway) =
+            get_default_ifindex_and_default_gateway().unwrap();
 
         let fd = open_af_packet();
 
