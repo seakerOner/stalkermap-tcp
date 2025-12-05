@@ -1,3 +1,9 @@
+use crate::tcp::{
+    TcpFamily,
+    internal::reactor::{DispatchedFrame, Dispatcher},
+};
+pub mod reactor;
+
 pub struct PacketFrame {
     pub ethernet_header: EthernetHeader,
     pub ipv4_header: Ipv4Header,
@@ -49,7 +55,7 @@ impl PacketFrame {
         }
     }
 
-    pub fn serialize_raw(&mut self, payload: &[u8]) -> Vec<u8> {
+    pub fn serialize(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1500);
 
         self.ethernet_header.serialize(&mut buf);
@@ -247,4 +253,58 @@ fn checksum(data: &[u8]) -> u16 {
     }
 
     !(sum as u16)
+}
+
+pub struct TcpConnection {
+    tcp_family: TcpFamily,
+    inner_packet: PacketFrame,
+    dispacher: Dispatcher,
+}
+
+impl TcpConnection {
+    pub fn new(frame: PacketFrame, family: TcpFamily, dispacher: Dispatcher) -> Self {
+        TcpConnection {
+            tcp_family: family,
+            inner_packet: frame,
+            dispacher: dispacher,
+        }
+    }
+
+    pub async fn connection_status(&mut self) -> SocketStatus {
+        #[cfg(target_os = "linux")]
+        {
+            let frame_addr = self.inner_packet.ipv4_header.dst_ip;
+            let frame_dst_port = self.inner_packet.tcp_header.destination_port;
+            let frame_seq_number = self.inner_packet.tcp_header.seq_number;
+
+            let (tx, rx) = tokio::sync::oneshot::channel::<SocketStatus>();
+            let dsp_frame = DispatchedFrame {
+                sender: tx,
+                tcp_family: self.tcp_family,
+                dst_addr: frame_addr,
+                dst_port: frame_dst_port,
+                seq_number: frame_seq_number,
+            };
+            self.dispacher.send(dsp_frame).await;
+
+            let r = rx.await;
+
+            match r {
+                Ok(status) => status,
+                Err(_) => SocketStatus::Error,
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            todo!("Implementation on Windows OS is not yet completed");
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub enum SocketStatus {
+    Open,
+    Closed,
+    Error,
 }
