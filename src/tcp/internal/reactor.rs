@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io, os::fd::RawFd};
+use std::{
+    collections::HashMap,
+    io,
+    os::fd::RawFd,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
@@ -15,6 +20,7 @@ pub struct PacketReactor {
     pending: HashMap<u64, DispatchedFrame>,
     receiver: Receiver<DispatchedFrame>,
     sender_for_dispacher: Option<Sender<DispatchedFrame>>,
+    ttl_for_packets_in_ms: Duration,
 }
 
 pub enum PacketReactorMode {
@@ -40,10 +46,19 @@ impl Dispatcher {
 
 pub(crate) struct DispatchedFrame {
     pub sender: Option<tokio::sync::oneshot::Sender<SocketStatus>>,
+    pub lifetime: std::time::Instant,
     pub tcp_family: TcpFamily,
     pub dst_addr: [u8; 4],
     pub dst_port: u16,
     pub seq_number: u32,
+}
+
+impl Drop for DispatchedFrame {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            sender.send(SocketStatus::TtlError).ok();
+        }
+    }
 }
 
 impl PacketReactor {
@@ -59,6 +74,7 @@ impl PacketReactor {
                         mmap: mmap,
                         receiver: rx,
                         sender_for_dispacher: Some(tx),
+                        ttl_for_packets_in_ms: Duration::from_millis(2000),
                     })
                 }
                 PacketReactorMode::Background => {
@@ -96,6 +112,10 @@ impl PacketReactor {
 
     pub(crate) fn get_raw_dispatcher(&mut self) -> Sender<DispatchedFrame> {
         self.sender_for_dispacher.take().unwrap()
+    }
+
+    pub fn set_ttl_for_packets_in_ms(&mut self, time_in_ms: u64) {
+        self.ttl_for_packets_in_ms = Duration::from_millis(time_in_ms);
     }
 
     pub async fn run(&mut self) {
@@ -140,14 +160,26 @@ impl PacketReactor {
                             self.pending.insert(key, f);
                         }
 
-                        let mmap = self.mmap;
-
                         if self.pending.is_empty() {
-                            continue;
+                            let f = self.receiver.recv().await;
+
+                            match f {
+                                Some(f) => {
+                                    let addr = u32::from_be_bytes(f.dst_addr);
+
+                                    let key = make_key(addr, f.dst_port, f.seq_number);
+                                    self.pending.insert(key, f);
+                                }
+                                None => {
+                                    break;
+                                }
+                            }
                         }
 
+                        let mmap = self.mmap;
+
                         // Run ring and find corresponding frames
-                        for block_idx in 0..TP_BLOCK_NR {
+                        'blocklevel: for block_idx in 0..TP_BLOCK_NR {
                             let block_ptr = unsafe {
                                 (mmap.mmap as *mut u8).add((block_idx * TP_BLOCK_SIZE) as usize)
                                     as *mut libc::tpacket_block_desc
@@ -163,7 +195,17 @@ impl PacketReactor {
                             let num_frames = hdr.num_pkts;
                             let mut offset = hdr.offset_to_first_pkt as usize;
 
+                            self.pending.shrink_to_fit();
+                            let now = Instant::now();
+                            self.pending.retain(|_, f| {
+                                now.duration_since(f.lifetime) <= self.ttl_for_packets_in_ms
+                            });
+
                             for _ in 0..num_frames {
+                                if self.pending.is_empty() {
+                                    break 'blocklevel;
+                                }
+
                                 let frame_ptr = unsafe {
                                     (block_ptr as *mut u8).add(offset) as *mut libc::tpacket3_hdr
                                 };
@@ -194,13 +236,6 @@ impl PacketReactor {
     }
 
     fn process_frame(&mut self, data: &[u8]) {
-        // TODO: generate "key" from `data`, verify if it exists in `self.pending`, if so check
-        // TcpFamily in the `DispatchedFrame` we got from the `self.pending` and check accordingly
-        // for the tcp handshake logic we want.
-        // HACK:
-        //                             (dst_addr)
-        // let key: u64 = (f.seq_number | addr | f.dst_port as u32) as u64;
-
         // min size Ether + IPv4
         if data.len() < 14 + 20 {
             return;
@@ -220,7 +255,7 @@ impl PacketReactor {
         let version = ip_header[0] >> 4;
         let ihl = (ip_header[0] & 0x0F) as usize * 4;
 
-        if ip_header.len() >= ihl {
+        if ip_header.len() < ihl {
             return;
         }
         if version != 4 {
@@ -252,6 +287,11 @@ impl PacketReactor {
                     let status = match flags {
                         f if f == (TcpFlags::SYN as u8 | TcpFlags::ACK as u8) => SocketStatus::Open,
                         f if f == TcpFlags::RST as u8 => SocketStatus::Closed,
+                        _ if Instant::now().duration_since(disp.lifetime)
+                            > self.ttl_for_packets_in_ms =>
+                        {
+                            SocketStatus::Pending
+                        }
                         _ => SocketStatus::Unknown,
                     };
 
@@ -270,6 +310,7 @@ fn make_key(addr: u32, port: u16, seq: u32) -> u64 {
     (addr, port, seq).hash(&mut h);
     h.finish()
 }
+
 impl Drop for PacketReactor {
     fn drop(&mut self) {
         let res = unsafe { libc::munmap(self.mmap.mmap, self.mmap.ptr_len) };

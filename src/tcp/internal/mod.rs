@@ -2,6 +2,7 @@ use crate::tcp::{
     TcpFamily,
     internal::reactor::{DispatchedFrame, Dispatcher},
 };
+use std::time::Instant;
 pub mod reactor;
 
 pub struct PacketFrame {
@@ -276,6 +277,7 @@ impl TcpConnection {
             let (tx, rx) = tokio::sync::oneshot::channel::<SocketStatus>();
             let dsp_frame = DispatchedFrame {
                 sender: Some(tx),
+                lifetime: Instant::now(),
                 tcp_family: self.tcp_family,
                 dst_addr: self.inner_packet.ipv4_header.dst_ip,
                 dst_port: self.inner_packet.tcp_header.destination_port,
@@ -303,6 +305,7 @@ pub enum SocketStatus {
     Open,
     Closed,
     Error,
+    TtlError,
     Pending,
     Unknown,
 }
