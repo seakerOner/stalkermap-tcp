@@ -262,7 +262,7 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
-    pub fn new(frame: PacketFrame, family: TcpFamily, dispacher: Dispatcher) -> Self {
+    pub(crate) fn new(frame: PacketFrame, family: TcpFamily, dispacher: Dispatcher) -> Self {
         TcpConnection {
             tcp_family: family,
             inner_packet: frame,
@@ -273,20 +273,16 @@ impl TcpConnection {
     pub async fn connection_status(&mut self) -> SocketStatus {
         #[cfg(target_os = "linux")]
         {
-            let frame_addr = self.inner_packet.ipv4_header.dst_ip;
-            let frame_dst_port = self.inner_packet.tcp_header.destination_port;
-            let frame_seq_number = self.inner_packet.tcp_header.seq_number;
-
             let (tx, rx) = tokio::sync::oneshot::channel::<SocketStatus>();
             let dsp_frame = DispatchedFrame {
-                sender: tx,
+                sender: Some(tx),
                 tcp_family: self.tcp_family,
-                dst_addr: frame_addr,
-                dst_port: frame_dst_port,
-                seq_number: frame_seq_number,
+                dst_addr: self.inner_packet.ipv4_header.dst_ip,
+                dst_port: self.inner_packet.tcp_header.destination_port,
+                seq_number: self.inner_packet.tcp_header.seq_number,
             };
-            self.dispacher.send(dsp_frame).await;
 
+            self.dispacher.send(dsp_frame).await;
             let r = rx.await;
 
             match r {
@@ -307,4 +303,5 @@ pub enum SocketStatus {
     Open,
     Closed,
     Error,
+    Pending,
 }

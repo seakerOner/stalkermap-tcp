@@ -24,7 +24,8 @@ use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 
 const TPACKET_V3: libc::c_int = 2;
-
+pub(crate) const TP_BLOCK_SIZE: u32 = 1 << 20; // 1MB blocks
+pub(crate) const TP_BLOCK_NR: u32 = 64;
 // open packet socket to send raw packets at the device driver (OSI Layer 2) level.
 fn open_af_packet() -> RawFd {
     unsafe {
@@ -207,11 +208,11 @@ fn set_sock_opt(fd: RawFd) -> Result<(*mut c_void, usize), SetSockOpsErrors> {
     }
 
     let req = libc::tpacket_req3 {
-        tp_block_size: 1 << 20, // 1MB blocks
-        tp_block_nr: 64,
+        tp_block_size: TP_BLOCK_SIZE, // 1MB blocks
+        tp_block_nr: TP_BLOCK_NR,
         tp_frame_size: 2048,
-        tp_frame_nr: (64 * (1 << 20)) / 2048,
-        tp_retire_blk_tov: 60, // timeout
+        tp_frame_nr: (TP_BLOCK_NR * TP_BLOCK_SIZE) / 2048,
+        tp_retire_blk_tov: 60, // timeout NOTE: Change this to (e.g: 20)
         tp_sizeof_priv: 0,
         tp_feature_req_word: 0,
     };
@@ -267,7 +268,6 @@ pub struct LinuxSocket {
     pub ifindex: i32,
     pub default_gateway: Ipv4Addr,
     pub src_mac: [u8; 6],
-    pub mmap: Option<(*mut c_void, usize)>,
 }
 
 impl LinuxSocket {
@@ -284,16 +284,14 @@ impl LinuxSocket {
             default_gateway,
             ifindex,
             src_mac,
-            mmap: None,
         })
     }
 
-    pub fn set_ops(&mut self) -> Result<(), LinuxSocketErrors> {
+    pub fn set_ops(&mut self) -> Result<(*mut c_void, usize), LinuxSocketErrors> {
         let (mmap, ptr_len) =
             set_sock_opt(self.fd).map_err(|e| LinuxSocketErrors::SetSockOps(e))?;
 
-        self.mmap.replace((mmap, ptr_len));
-        Ok(())
+        Ok((mmap, ptr_len))
     }
 
     pub fn send_raw_packet(
@@ -329,13 +327,6 @@ impl LinuxSocket {
 
 impl Drop for LinuxSocket {
     fn drop(&mut self) {
-        if let Some((mmap, ptr_len)) = self.mmap.take() {
-            let res = unsafe { libc::munmap(mmap, ptr_len) };
-            if res != 0 {
-                eprintln!("Failed to remove any mappings from the adress space");
-            }
-        }
-
         unsafe { libc::close(self.fd) };
     }
 }
