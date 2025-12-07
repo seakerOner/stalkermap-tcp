@@ -86,7 +86,7 @@ fn lookup_arp_cache(ip: Ipv4Addr) -> io::Result<Option<[u8; 6]>> {
     Ok(None)
 }
 
-pub fn resolve_mac(socket: &LinuxSocket, dst_ip: Ipv4Addr) -> io::Result<[u8; 6]> {
+pub(crate) fn resolve_mac(socket: &LinuxSocket, dst_ip: Ipv4Addr) -> io::Result<[u8; 6]> {
     if let Some(mac) = lookup_arp_cache(dst_ip)? {
         return Ok(mac);
     }
@@ -102,7 +102,7 @@ pub fn resolve_mac(socket: &LinuxSocket, dst_ip: Ipv4Addr) -> io::Result<[u8; 6]
     ))
 }
 
-pub fn resolve_src_mac(iface: &str) -> io::Result<[u8; 6]> {
+pub(crate) fn resolve_src_mac(iface: &str) -> io::Result<[u8; 6]> {
     let path = format!("/sys/class/net/{}/address", iface);
     let s = fs::read_to_string(path)?.trim().to_string();
 
@@ -271,7 +271,7 @@ pub struct LinuxSocket {
 }
 
 impl LinuxSocket {
-    pub fn new() -> Result<Self, LinuxSocketErrors> {
+    pub(crate) fn new() -> Result<Self, LinuxSocketErrors> {
         let (iface, ifindex, default_gateway) =
             get_default_ifindex_and_default_gateway().map_err(|e| LinuxSocketErrors::Io(e))?;
         let src_mac = resolve_src_mac(iface.as_str()).map_err(|e| LinuxSocketErrors::Io(e))?;
@@ -287,14 +287,14 @@ impl LinuxSocket {
         })
     }
 
-    pub fn set_ops(&mut self) -> Result<(*mut c_void, usize), LinuxSocketErrors> {
+    pub(crate) fn set_ops(&mut self) -> Result<Mmap, LinuxSocketErrors> {
         let (mmap, ptr_len) =
             set_sock_opt(self.fd).map_err(|e| LinuxSocketErrors::SetSockOps(e))?;
 
-        Ok((mmap, ptr_len))
+        Ok(Mmap::new(mmap, ptr_len))
     }
 
-    pub fn send_raw_packet(
+    pub(crate) fn send_raw_packet(
         &self,
         dst_mac: [u8; 6],
         ether_type: u16,
@@ -337,6 +337,20 @@ pub enum LinuxSocketErrors {
     SetSockOps(SetSockOpsErrors),
     SendingPacket(std::io::Error),
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct Mmap {
+    pub(crate) mmap: *mut c_void,
+    pub(crate) ptr_len: usize,
+}
+
+impl Mmap {
+    fn new(mmap: *mut c_void, ptr_len: usize) -> Self {
+        Self { mmap, ptr_len }
+    }
+}
+
+unsafe impl Send for Mmap {}
 
 #[cfg(test)]
 mod tests {

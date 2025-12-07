@@ -24,11 +24,11 @@ impl TcpSyn {
         {
             let mut socket = LinuxSocket::new().map_err(|e| TcpSynErrors::LinuxSocketErr(e))?;
 
-            let (mmap, ptr_length) = socket
+            let mmap = socket
                 .set_ops()
                 .map_err(|e| TcpSynErrors::LinuxSocketErr(e))?;
 
-            let mut reactor = PacketReactor::new(socket.fd, (mmap, ptr_length), reactor_mode)
+            let mut reactor = PacketReactor::new(socket.fd, mmap, reactor_mode)
                 .map_err(|e| TcpSynErrors::Io(e))?;
 
             Ok((
@@ -54,7 +54,7 @@ impl TcpSyn {
     ) -> Result<TcpConnection, TcpSynErrors> {
         #[cfg(target_os = "linux")]
         {
-            use crate::sys::resolve_mac;
+            use crate::sys::linux::resolve_mac;
 
             let dst_mac = resolve_mac(&self.linux_socket, ip).map_err(|e| TcpSynErrors::Io(e))?;
 
@@ -111,9 +111,9 @@ mod tests {
     #[tokio::test]
     async fn tcp_syn_read_ring_buffer_test() {
         let (tcp, mut reactor) = TcpSyn::init(PacketReactorMode::default()).unwrap();
-        // tokio::task::spawn(async move {
-        //     reactor.run().await;
-        // });
+        tokio::task::spawn(async move {
+            reactor.run().await;
+        });
 
         let c = tcp.try_connect(Ipv4Addr::new(127, 0, 0, 1), 8080);
 

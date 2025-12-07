@@ -4,6 +4,7 @@ pub mod internal;
 pub(crate) enum TcpFamily {
     TcpSyn,
 }
+
 /// # SYN Scan (Half-open scan)
 /// ```text
 /// Send(SYN) -> if Open   -> SYN/ACK -> Send(RST)

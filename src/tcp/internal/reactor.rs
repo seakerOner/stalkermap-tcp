@@ -1,11 +1,17 @@
-use std::{collections::HashMap, ffi::c_void, io, os::fd::RawFd};
+use std::{collections::HashMap, io, os::fd::RawFd};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::tcp::{TcpFamily, internal::SocketStatus, internal::TcpFlags};
+use crate::{
+    sys::linux::Mmap,
+    tcp::{
+        TcpFamily,
+        internal::{SocketStatus, TcpFlags},
+    },
+};
 
 pub struct PacketReactor {
     epoll_fd: Option<RawFd>,
-    mmap: (*mut c_void, usize),
+    mmap: Mmap,
     pending: HashMap<u64, DispatchedFrame>,
     receiver: Receiver<DispatchedFrame>,
     sender_for_dispacher: Option<Sender<DispatchedFrame>>,
@@ -41,11 +47,7 @@ pub(crate) struct DispatchedFrame {
 }
 
 impl PacketReactor {
-    pub fn new(
-        _socket_fd: RawFd,
-        mmap: (*mut c_void, usize),
-        mode: PacketReactorMode,
-    ) -> io::Result<Self> {
+    pub(crate) fn new(_socket_fd: RawFd, mmap: Mmap, mode: PacketReactorMode) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             match mode {
@@ -138,7 +140,7 @@ impl PacketReactor {
                             self.pending.insert(key, f);
                         }
 
-                        let (mmap_ptr, _ptr_len) = self.mmap;
+                        let mmap = self.mmap;
 
                         if self.pending.is_empty() {
                             continue;
@@ -147,7 +149,7 @@ impl PacketReactor {
                         // Run ring and find corresponding frames
                         for block_idx in 0..TP_BLOCK_NR {
                             let block_ptr = unsafe {
-                                (mmap_ptr as *mut u8).add((block_idx * TP_BLOCK_SIZE) as usize)
+                                (mmap.mmap as *mut u8).add((block_idx * TP_BLOCK_SIZE) as usize)
                                     as *mut libc::tpacket_block_desc
                             };
 
@@ -270,8 +272,7 @@ fn make_key(addr: u32, port: u16, seq: u32) -> u64 {
 }
 impl Drop for PacketReactor {
     fn drop(&mut self) {
-        let (mmap, ptr_len) = self.mmap;
-        let res = unsafe { libc::munmap(mmap, ptr_len) };
+        let res = unsafe { libc::munmap(self.mmap.mmap, self.mmap.ptr_len) };
         if res != 0 {
             eprintln!("Failed to remove any mappings from the adress space");
         }
