@@ -91,6 +91,8 @@ impl TcpSyn {
 mod tests {
     use std::net::Ipv4Addr;
 
+    use crate::tcp::internal::SocketStatus;
+
     use super::*;
 
     #[test]
@@ -104,5 +106,21 @@ mod tests {
 
         // HACK:
         // let x = r.unwrap().connection_status().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_syn_read_ring_buffer_test() {
+        let (tcp, mut reactor) = TcpSyn::init(PacketReactorMode::default()).unwrap();
+        // tokio::task::spawn(async move {
+        //     reactor.run().await;
+        // });
+
+        let c = tcp.try_connect(Ipv4Addr::new(127, 0, 0, 1), 8080);
+
+        assert!(c.is_ok());
+
+        let status = c.unwrap().connection_status().await;
+
+        assert_eq!(status, SocketStatus::Unknown);
     }
 }

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ffi::c_void, io, os::fd::RawFd};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::tcp::{TcpFamily, internal::SocketStatus};
+use crate::tcp::{TcpFamily, internal::SocketStatus, internal::TcpFlags};
 
 pub struct PacketReactor {
     epoll_fd: Option<RawFd>,
@@ -132,16 +132,17 @@ impl PacketReactor {
                         use crate::sys::linux::TP_BLOCK_SIZE;
 
                         while let Ok(f) = self.receiver.try_recv() {
-                            let mut addr: u32 = 0;
-                            for o in f.dst_addr {
-                                addr |= o as u32;
-                            }
-                            let key: u64 = (f.seq_number | addr | f.dst_port as u32) as u64;
+                            let addr = u32::from_be_bytes(f.dst_addr);
+
+                            let key = make_key(addr, f.dst_port, f.seq_number);
                             self.pending.insert(key, f);
                         }
-                        self.pending.shrink_to_fit();
 
                         let (mmap_ptr, _ptr_len) = self.mmap;
+
+                        if self.pending.is_empty() {
+                            continue;
+                        }
 
                         // Run ring and find corresponding frames
                         for block_idx in 0..TP_BLOCK_NR {
@@ -172,7 +173,7 @@ impl PacketReactor {
                                     std::slice::from_raw_parts(data_ptr, frame.tp_len as usize)
                                 };
 
-                                self.process_frame(data, &frame);
+                                self.process_frame(data);
 
                                 if frame.tp_next_offset == 0 {
                                     break;
@@ -190,14 +191,83 @@ impl PacketReactor {
         }
     }
 
-    fn process_frame(&mut self, data: &[u8], hdr: &libc::tpacket3_hdr) {
-        todo!()
+    fn process_frame(&mut self, data: &[u8]) {
         // TODO: generate "key" from `data`, verify if it exists in `self.pending`, if so check
         // TcpFamily in the `DispatchedFrame` we got from the `self.pending` and check accordingly
         // for the tcp handshake logic we want.
+        // HACK:
+        //                             (dst_addr)
+        // let key: u64 = (f.seq_number | addr | f.dst_port as u32) as u64;
+
+        // min size Ether + IPv4
+        if data.len() < 14 + 20 {
+            return;
+        }
+
+        // ether header  NOTE: ignoring dst_mac and src_mac on eth header
+        let ethertype = u16::from_be_bytes([data[12], data[13]]);
+
+        if ethertype != libc::ETH_P_IP as u16 {
+            return;
+        }
+
+        // ipv4 header
+        let ip_start = 14;
+        let ip_header = &data[ip_start..];
+
+        let version = ip_header[0] >> 4;
+        let ihl = (ip_header[0] & 0x0F) as usize * 4;
+
+        if ip_header.len() >= ihl {
+            return;
+        }
+        if version != 4 {
+            return;
+        }
+
+        let dst_addr = &ip_header[16..20];
+        let addr = u32::from_be_bytes([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]);
+
+        // tcp header
+        let tcp_start = 14 + ihl; // ether header + ipv4 header
+
+        if data.len() < tcp_start + 20 {
+            return;
+        }
+        let tcp_header = &data[tcp_start..];
+
+        let dst_port = u16::from_be_bytes([tcp_header[2], tcp_header[3]]);
+        let seq_number =
+            u32::from_be_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]);
+
+        let flags = tcp_header[13];
+
+        let key = make_key(addr, dst_port, seq_number);
+
+        if let Some(mut disp) = self.pending.remove(&key) {
+            match disp.tcp_family {
+                TcpFamily::TcpSyn => {
+                    let status = match flags {
+                        f if f == (TcpFlags::SYN as u8 | TcpFlags::ACK as u8) => SocketStatus::Open,
+                        f if f == TcpFlags::RST as u8 => SocketStatus::Closed,
+                        _ => SocketStatus::Unknown,
+                    };
+
+                    if let Some(sender) = disp.sender.take() {
+                        sender.send(status).ok();
+                    }
+                }
+            }
+        }
     }
 }
 
+fn make_key(addr: u32, port: u16, seq: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    (addr, port, seq).hash(&mut h);
+    h.finish()
+}
 impl Drop for PacketReactor {
     fn drop(&mut self) {
         let (mmap, ptr_len) = self.mmap;

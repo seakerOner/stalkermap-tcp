@@ -298,10 +298,11 @@ impl TcpConnection {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum SocketStatus {
     Open,
     Closed,
     Error,
     Pending,
+    Unknown,
 }
