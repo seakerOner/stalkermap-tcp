@@ -262,8 +262,8 @@ impl PacketReactor {
             return;
         }
 
-        let dst_addr = &ip_header[16..20];
-        let addr = u32::from_be_bytes([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]);
+        let src_addr = &ip_header[12..16];
+        let addr = u32::from_be_bytes([src_addr[0], src_addr[1], src_addr[2], src_addr[3]]);
 
         // tcp header
         let tcp_start = 14 + ihl; // ether header + ipv4 header
@@ -274,12 +274,12 @@ impl PacketReactor {
         let tcp_header = &data[tcp_start..];
 
         let dst_port = u16::from_be_bytes([tcp_header[2], tcp_header[3]]);
-        let seq_number =
-            u32::from_be_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]);
+        let ack_number =
+            u32::from_be_bytes([tcp_header[8], tcp_header[9], tcp_header[10], tcp_header[11]]);
 
         let flags = tcp_header[13];
 
-        let key = make_key(addr, dst_port, seq_number);
+        let key = make_key(addr, dst_port, ack_number - 1);
 
         if let Some(mut disp) = self.pending.remove(&key) {
             match disp.tcp_family {
